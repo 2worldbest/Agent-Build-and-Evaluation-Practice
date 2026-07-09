@@ -51,14 +51,15 @@ insecure_http_async_client = httpx.AsyncClient(verify=False)
 
 # OpenRouter는 OpenAI 호환 API를 제공하므로 model_provider를 openai로 설정합니다.
 model = init_chat_model(
-    model="openai/gpt-5-mini",
+    model="anthropic/claude-sonnet-5",
     model_provider="openai",
     api_key=api_key,
     base_url=base_url,
     streaming=True,
-    # gpt-5 계열은 추론 시간이 길어 사소한 질문도 수십 초 걸린다. low 로 두면 호출당
-    # 지연이 크게 줄어 메신저 응답이 빨라진다. 복잡한 추론이 필요하면 medium/high 로.
-    reasoning_effort="low",
+    # reasoning_effort 는 OpenRouter 가 provider 별 추론 설정으로 변환한다(Anthropic 은
+    # thinking budget 으로 매핑). low 는 지연이 짧고, 복잡한 추론·에이전트 지속성이
+    # 필요하면 medium/high 로 올린다.
+    reasoning_effort="medium",
     http_client=insecure_http_client,
     http_async_client=insecure_http_async_client,
 )
@@ -72,9 +73,9 @@ WORKSPACE = Path(os.getenv("WORKSPACE_DIR", "workspace")).expanduser().resolve()
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 # 스킬 디렉터리(workspace/skills). 각 스킬은 SKILL.md(+ 스크립트)를 가진 하위 폴더다.
-# 프로젝트의 example_skills/ 를 workspace/skills 로 매 실행 시 동기화한다.
-# → 예시 스킬을 업데이트하면 자동 반영된다. 커스텀 스킬은 example_skills 밖의
-#   다른 이름으로 workspace/skills 에 만들면 이 동기화의 영향을 받지 않는다.
+# git 으로 관리되는 workspace_seed/skills/ 를 workspace/skills 로 매 실행 시 동기화한다.
+# → 시드 스킬을 업데이트하면 자동 반영된다. 이 시드를 거치지 않는 일회성 스킬은
+#   workspace_seed 밖의 다른 이름으로 workspace/skills 에 직접 만들면 된다(동기화 영향 없음).
 #
 # 주의: shutil.copytree 는 내용이 같아도 매번 파일을 다시 써 mtime 을 바꾼다.
 # langgraph dev 는 workspace/ 를 감시(watchfiles)하므로, 그럴 경우 import→동기화→
@@ -98,9 +99,9 @@ def _sync_tree(src: Path, dst: Path) -> None:
 
 _skills_dir = WORKSPACE / "skills"
 _skills_dir.mkdir(parents=True, exist_ok=True)
-_example_skills = Path("example_skills")
-if _example_skills.is_dir():
-    for _src in _example_skills.iterdir():
+_seed_skills = Path("workspace_seed/skills")
+if _seed_skills.is_dir():
+    for _src in _seed_skills.iterdir():
         if _src.is_dir():
             _sync_tree(_src, _skills_dir / _src.name)
 
@@ -112,16 +113,22 @@ if not _triggers.exists():
 
 # 메모리 파일(workspace/AGENTS.md). 에이전트가 사용자의 선호·피드백·역할 등을
 # edit_file 로 이 파일에 스스로 기록하고, 다음 세션에 자동으로 불러온다.
-# edit_file 은 기존 파일을 대상으로 하므로, 없으면 최소 템플릿으로 미리 만들어 둔다.
+# 초기 템플릿은 git 으로 관리되는 workspace_seed/AGENTS.md 를 쓴다(없을 때만 주입 =
+# seed-once). 이미 있으면 건드리지 않아, 에이전트가 런타임에 쌓은 기억이 보존된다.
+# 시드 파일이 없으면 최소 인라인 템플릿으로 대체한다.
 _agents_md = WORKSPACE / "AGENTS.md"
 if not _agents_md.exists():
-    _agents_md.write_text(
-        "# Agent Memory\n\n"
-        "이 파일은 에이전트가 사용자에 대해 학습한 내용을 기록하는 장기 메모리다.\n"
-        "(선호, 반복되는 피드백, 역할 정의, 도구 사용에 필요한 정보 등)\n\n"
-        "## User\n\n## Preferences\n\n## Notes\n",
-        encoding="utf-8",
-    )
+    _seed_md = Path("workspace_seed/AGENTS.md")
+    if _seed_md.is_file():
+        _agents_md.write_text(_seed_md.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        _agents_md.write_text(
+            "# Agent Memory\n\n"
+            "이 파일은 에이전트가 사용자에 대해 학습한 내용을 기록하는 장기 메모리다.\n"
+            "(선호, 반복되는 피드백, 역할 정의, 도구 사용에 필요한 정보 등)\n\n"
+            "## User\n\n## Preferences\n\n## Notes\n",
+            encoding="utf-8",
+        )
 
 # LocalShellBackend = 실제 파일시스템 조작 + 셸 실행(execute).
 # - virtual_mode=True: 파일 도구의 경로를 workspace 기준으로 제한(.. 탈출 방지 가드레일).
@@ -157,11 +164,36 @@ def _web_search_tools() -> list:
         return []
     try:
         from langchain_tavily import TavilySearch
+        from langchain_core.tools import StructuredTool
     except ImportError:
         print("[connector] langchain-tavily 미설치 — 웹 검색 건너뜀")
         return []
+
+    base = TavilySearch(max_results=5)
+
+    def _sanitize(kwargs: dict) -> dict:
+        # Tavily 는 finance 토픽 + fast/ultra-fast search_depth 조합을 400 으로 거부한다.
+        # LLM 이 이 조합을 고르면 search_depth 를 advanced 로 낮춰 유효한 호출로 보정한다.
+        if kwargs.get("topic") == "finance" and kwargs.get("search_depth") in ("fast", "ultra-fast"):
+            kwargs = {**kwargs, "search_depth": "advanced"}
+        return kwargs
+
+    def _search(**kwargs):
+        return base.invoke(_sanitize(kwargs))
+
+    async def _asearch(**kwargs):
+        return await base.ainvoke(_sanitize(kwargs))
+
     print("[connector] Tavily 웹 검색 활성화")
-    return [TavilySearch(max_results=5)]
+    return [
+        StructuredTool.from_function(
+            func=_search,
+            coroutine=_asearch,
+            name=base.name,
+            description=base.description,
+            args_schema=base.args_schema,
+        )
+    ]
 
 
 def _mcp_tools() -> list:
