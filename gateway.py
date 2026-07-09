@@ -40,6 +40,7 @@ agent = None
 # 에이전트 호출을 직렬화한다(개인용 저부하 가정). 채널이 동시에 들어와도
 # 모델/백엔드 상태 충돌 없이 안전하게 처리된다.
 _agent_lock = threading.Lock()
+_RUNNING_CHANNELS: set[str] = set()
 
 
 def _load_agent():
@@ -196,6 +197,7 @@ class TelegramAdapter(ChannelAdapter):
 
     def __init__(self) -> None:
         self.c = connectors.TelegramConnector()
+        self._polling_started = False
         _os = __import__("os")
         # 스트리밍 on/off 및 편집 주기.
         # 텔레그램은 '채팅당 대략 1건/초'가 지속 한도이고 편집(editMessageText)도 여기
@@ -211,7 +213,15 @@ class TelegramAdapter(ChannelAdapter):
         return ("ok" if ok else "fail"), detail
 
     def run(self) -> None:
+        if not self.c.enabled:
+            return
+        if self._polling_started:
+            print("[telegram] 이미 폴링 중이므로 이 인스턴스는 종료합니다.")
+            return
+        self._polling_started = True
+        self.c.clear_webhook()
         offset = None
+        backoff = 1.0
         while True:
             try:
                 for u in self.c.get_updates(offset=offset, timeout=25):
@@ -239,10 +249,15 @@ class TelegramAdapter(ChannelAdapter):
                         f"[telegram] 답장 전송 → {chat_id} "
                         f"({time.monotonic() - started:.1f}s)"
                     )
+                backoff = 1.0
             except Exception as e:
-                # 간헐적 네트워크 리셋 등은 전체 트레이스백 대신 한 줄로 로깅 후 재시도.
+                # 409는 봇이 웹훅/다른 폴링과 충돌 중임을 의미하므로, 짧은 백오프 후
+                # 웹훅을 다시 비우고 폴링을 이어간다.
                 print(f"[telegram] 폴링 오류(재시도): {type(e).__name__}: {str(e)[:120]}")
-                time.sleep(5)
+                if "409" in str(e):
+                    self.c.clear_webhook()
+                time.sleep(min(backoff, 10.0))
+                backoff = min(backoff * 2, 10.0)
 
     def _respond_stream(self, text: str, conv_id: str, chat_id: str) -> None:
         """answer_stream 을 소비하며 editMessageText 로 실시간 갱신한다(Slack 대칭).
@@ -606,6 +621,10 @@ def start_in_background(agent_factory=None) -> list[str]:
 
     반환: 실제로 실행된(연결 확인된) 채널 이름 리스트.
     """
+    if _RUNNING_CHANNELS:
+        print("[gateway] 이미 실행 중인 채널이 있어 새 게이트웨이 스레드를 시작하지 않습니다.")
+        return list(_RUNNING_CHANNELS)
+
     active: list[ChannelAdapter] = []
     for a in (TelegramAdapter(), SlackAdapter(), EmailTriggerAdapter()):
         state, detail = a.check()
@@ -625,6 +644,7 @@ def start_in_background(agent_factory=None) -> list[str]:
         _ensure_agent()
 
     for a in active:
+        _RUNNING_CHANNELS.add(a.name)
         threading.Thread(target=a.run, name=a.name, daemon=True).start()
     return [a.name for a in active]
 

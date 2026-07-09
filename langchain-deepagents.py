@@ -405,9 +405,15 @@ def _build_dev_command(passthrough: list) -> tuple:
     port = os.getenv("LANGGRAPH_PORT")
     if port and not _flag_present(passthrough, "--port"):
         cmd += ["--port", port]
-    host = os.getenv("LANGGRAPH_HOST")
-    if host and not _flag_present(passthrough, "--host"):
-        cmd += ["--host", host]
+
+    if not _flag_present(passthrough, "--host"):
+        host = os.getenv("LANGGRAPH_HOST")
+        if host:
+            cmd += ["--host", host]
+        elif (not use_tunnel) and _is_remote_env():
+            # GitHub 포트포워딩 URL(예: *.app.github.dev)로 접근하려면 서버가
+            # localhost 뿐 아니라 0.0.0.0 에 바인딩돼야 한다.
+            cmd += ["--host", "0.0.0.0"]
 
     cmd += passthrough
     return cmd, use_tunnel

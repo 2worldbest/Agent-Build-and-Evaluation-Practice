@@ -210,6 +210,8 @@ class TelegramConnector:
 
     def verify(self) -> tuple[bool, str]:
         """getMe 로 봇 토큰 유효성과 연결을 확인한다."""
+        if not self.enabled:
+            return False, "TELEGRAM_BOT_TOKEN 이 설정되지 않았습니다."
         try:
             r = _tg_get(f"{self._api}/getMe", timeout=15)
             data = r.json()
@@ -218,6 +220,22 @@ class TelegramConnector:
             return False, f"getMe 실패: {data.get('description')}"
         except Exception as e:
             return False, str(e)
+
+    def clear_webhook(self) -> bool:
+        """기존 웹훅이 있으면 제거해 롱폴링이 충돌하지 않도록 한다."""
+        if not self.enabled:
+            return False
+        try:
+            r = _tg_post(
+                f"{self._api}/deleteWebhook",
+                json={"drop_pending_updates": True},
+                timeout=20,
+            )
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"[telegram] webhook 해제 실패: {e}")
+            return False
 
     def send(self, text: str, chat_id: str = "") -> str:
         target = chat_id or self.default_chat
