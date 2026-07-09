@@ -1,0 +1,18 @@
+[Unit]
+Description=TIGER Nasdaq 100 Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=codespace
+WorkingDirectory=/workspaces/Agent-Build-and-Evaluation-Practice
+ExecStart=/usr/bin/python3 /workspaces/Agent-Build-and-Evaluation-Practice/workspace/skills/tiger-nasdaq-monitor/schedule_tiger_monitor.py
+Restart=always
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/workspaces/Agent-Build-and-Evaluation-Practice/.env
+StandardOutput=append:/var/log/tiger_monitor.log
+StandardError=append:/var/log/tiger_monitor.log
+
+[Install]
+WantedBy=multi-user.target
